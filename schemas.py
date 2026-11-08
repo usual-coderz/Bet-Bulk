@@ -5,7 +5,7 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-DEFAULT_SELECTORS = {
+BASE_SELECTORS = {
     "form_ready": "input[type=tel]",
     "mobile": "input[type=tel]",
     "password": "input[type=password]",
@@ -18,20 +18,20 @@ DEFAULT_SELECTORS = {
 }
 
 
-def site_doc(slug, name, base_url, selectors: dict | None = None) -> dict:
+def site_doc(slug: str, name: str, base_url: str,
+             selectors: dict | None = None, pad_right: int = 0) -> dict:
     return {
         "slug": slug,
         "name": name,
         "enabled": True,
         "base_url": base_url,
-        "mode": "browser",
-        "needs_captcha": True,
-        "selectors": {**DEFAULT_SELECTORS, **(selectors or {})},
+        "pad_right": pad_right,
+        "selectors": {**BASE_SELECTORS, **(selectors or {})},
         "created_at": now(),
     }
 
 
-def job_doc(tg_id, site_slug, invite_code, count, gap_sec) -> dict:
+def job_doc(tg_id: int, site_slug: str, invite_code: str, count: int, gap_sec: int) -> dict:
     return {
         "tg_id": tg_id,
         "site_slug": site_slug,
@@ -42,13 +42,21 @@ def job_doc(tg_id, site_slug, invite_code, count, gap_sec) -> dict:
         "failed": 0,
         "status": "queued",
         "progress_msg_id": None,
+        "error": None,
         "created_at": now(),
+        "claimed_at": None,
     }
 
 
-def cred_doc(job_id, site_slug, username, password_enc, mobile, status="ok", error=None) -> dict:
+def cred_doc(job_id, site_slug: str, username: str, password_enc: str,
+             mobile: str, status: str = "ok", error: str | None = None) -> dict:
     return {
-        "job_id": job_id, "site_slug": site_slug, "username": username,
-        "password_enc": password_enc, "mobile": mobile,
-        "status": status, "error": error, "created_at": now(),
+        "job_id": job_id,
+        "site_slug": site_slug,
+        "username": username,
+        "password_enc": password_enc,
+        "mobile": mobile,
+        "status": status,
+        "error": error,
+        "created_at": now(),
     }
