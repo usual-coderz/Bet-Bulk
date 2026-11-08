@@ -1,4 +1,5 @@
 import asyncio
+
 from db import init_indexes, sites
 from schemas import site_doc
 
@@ -10,11 +11,11 @@ SEED = [
 ]
 
 
-async def main():
+async def main() -> None:
     await init_indexes()
     for s in SEED:
         await sites.update_one({"slug": s["slug"]}, {"$setOnInsert": s}, upsert=True)
-    print("seeded 4 sites")
+    print("4 sites seeded")
 
 
 if __name__ == "__main__":
