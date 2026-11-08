@@ -1,0 +1,7 @@
+.env
+logs/
+*.db
+proxy_cache.txt
+__pycache__/
+*.pyc
+.venv/
