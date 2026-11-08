@@ -56,10 +56,13 @@ async def _fetch(c: httpx.AsyncClient, url: str) -> set[str]:
 async def _check(c: httpx.AsyncClient, proxy: str, sem: asyncio.Semaphore) -> str | None:
     async with sem:
         try:
-            r = await c.get(TEST_URL, proxy=proxy, timeout=8, follow_redirects=True)
-            return proxy if r.status_code < 500 else None
-        except Exception:
-            return None
+            r = await c.get(TEST_URL, proxy=proxy, timeout=12, follow_redirects=True)
+            if r.status_code < 500:
+                return proxy
+            log.debug("Proxy HTTP error %s: %s", proxy, r.status_code)
+        except Exception as e:
+            log.debug("Proxy failed %s: %s: %s", proxy, type(e).__name__, e)
+        return None
 
 
 async def refresh(force: bool = False) -> int:
