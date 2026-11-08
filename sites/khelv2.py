@@ -1,4 +1,3 @@
-# sites/khelv2.py
 from sites.family import FamilyAdapter
 
 
