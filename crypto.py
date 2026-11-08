@@ -1,5 +1,5 @@
-# crypto.py
 from cryptography.fernet import Fernet
+
 from config import settings
 
 _f = Fernet(settings.fernet_key.encode())
