@@ -1,0 +1,2 @@
+class RegisterError(Exception):
+    pass
