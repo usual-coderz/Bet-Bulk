@@ -11,7 +11,7 @@ import pdfgen
 from config import settings
 from db import credentials, jobs, sites
 from identity import mobile, password, username
-from proxies import mark_dead, pick
+from proxies import mark_dead, pick, size
 from schemas import cred_doc, now
 from sites.base import RegisterError
 from sites.registry import build
@@ -46,6 +46,21 @@ async def _heartbeat(oid: ObjectId, started: float) -> None:
             log.debug("heartbeat fail", exc_info=True)
 
 
+def _acquire_proxy(tag: str, attempt: int) -> str | None:
+    proxy = pick()
+
+    if proxy:
+        log.info("%s attempt=%d proxy=%s", tag, attempt, proxy)
+        return proxy
+
+    if settings.proxy_mode == "off":
+        log.info("%s attempt=%d DIRECT (mode=off)", tag, attempt)
+    else:
+        log.warning("%s attempt=%d DIRECT (pool khaali, size=%d)", tag, attempt, size())
+
+    return None
+
+
 async def _one(job_id: str, site: dict, ident: dict, idx: int) -> bool:
     adapter = build(site)
     sem = _sem.setdefault(site["slug"], asyncio.Semaphore(settings.per_site))
@@ -53,10 +68,7 @@ async def _one(job_id: str, site: dict, ident: dict, idx: int) -> bool:
     err = "unknown"
 
     for attempt in range(1, 4):
-        proxy = pick()
-        log.info("%s attempt=%d proxy=%s", tag, attempt, proxy or "DIRECT")
-        if not proxy:
-            log.warning("%s proxy pool khaali", tag)
+        proxy = _acquire_proxy(tag, attempt)
 
         async with sem:
             try:
@@ -71,7 +83,7 @@ async def _one(job_id: str, site: dict, ident: dict, idx: int) -> bool:
                 log.warning("%s fail: %s", tag, err)
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
-                log.exception("%s unexpected", tag)
+                log.exception("%s unexpected error", tag)
             finally:
                 if proxy:
                     mark_dead(proxy)
@@ -81,27 +93,38 @@ async def _one(job_id: str, site: dict, ident: dict, idx: int) -> bool:
     log.error("%s FAILED 3 attempts: %s", tag, err)
     await credentials.insert_one(cred_doc(
         job_id, site["slug"], ident["username"],
-        crypto.enc(ident["password"]), ident["mobile"], status="failed", error=err))
+        crypto.enc(ident["password"]), ident["mobile"],
+        status="failed", error=err))
     return False
+
+
+def _new_idents(job: dict, count: int) -> list[dict]:
+    return [{
+        "username": username(),
+        "password": password(),
+        "mobile": mobile(),
+        "invite_code": job["invite_code"],
+    } for _ in range(count)]
 
 
 async def run_job(job_id: str) -> None:
     oid = ObjectId(job_id)
+
     job = await jobs.find_one_and_update(
         {"_id": oid, "status": "queued"},
         {"$set": {"status": "running", "claimed_at": now()}},
     )
     if not job:
-        log.warning("job=%s claim fail", job_id)
+        log.warning("job=%s claim fail (status badal gaya)", job_id)
         return
 
     started = time.time()
-    log.info("job=%s START site=%s count=%d code=%s",
-             job_id, job["site_slug"], job["count"], job["invite_code"])
+    log.info("job=%s START site=%s count=%d code=%s proxy_pool=%d",
+             job_id, job["site_slug"], job["count"], job["invite_code"], size())
 
     site = await sites.find_one({"slug": job["site_slug"], "enabled": True})
     if not site:
-        log.error("job=%s site missing", job_id)
+        log.error("job=%s site missing/disabled: %s", job_id, job["site_slug"])
         await jobs.update_one({"_id": oid}, {"$set": {
             "status": "failed", "error": "site missing", "finished_at": now()}})
         notify.send(job["tg_id"], "Site config missing hai.")
@@ -109,22 +132,19 @@ async def run_job(job_id: str) -> None:
 
     if job.get("progress_msg_id"):
         notify.edit(job["tg_id"], job["progress_msg_id"], _text(job, 0))
+
     _heartbeats[job_id] = asyncio.create_task(_heartbeat(oid, started))
 
     ok_rows: list[dict] = []
+
     try:
         for start in range(0, job["count"], settings.batch):
             chunk = min(settings.batch, job["count"] - start)
             log.info("job=%s wave start=%d size=%d", job_id, start, chunk)
 
-            idents = [{
-                "username": username(),
-                "password": password(),
-                "mobile": mobile(),
-                "invite_code": job["invite_code"],
-            } for _ in range(chunk)]
-
+            idents = _new_idents(job, chunk)
             tasks = []
+
             for i, ident in enumerate(idents):
                 tasks.append(asyncio.create_task(_one(job_id, site, ident, start + i + 1)))
                 await asyncio.sleep(secrets.randint(5, 10))
@@ -134,9 +154,7 @@ async def run_job(job_id: str) -> None:
             log.info("job=%s wave done ok=%d fail=%d", job_id, done, failed)
 
             await jobs.update_one({"_id": oid}, {"$inc": {"done": done, "failed": failed}})
-            for ident, ok in zip(idents, results):
-                if ok:
-                    ok_rows.append(ident)
+            ok_rows.extend(i for i, ok in zip(idents, results) if ok)
 
             fresh = await jobs.find_one({"_id": oid})
             if fresh and fresh.get("progress_msg_id"):
@@ -144,18 +162,23 @@ async def run_job(job_id: str) -> None:
                             _text(fresh, int(time.time() - started)))
 
         if ok_rows:
-            log.info("job=%s report bana rahe (%d)", job_id, len(ok_rows))
+            log.info("job=%s report bana rahe (%d ok)", job_id, len(ok_rows))
             txt, pdf = pdfgen.build(ok_rows, job["site_slug"], job_id)
             notify.send_document(job["tg_id"], pdf,
                                  caption=f"{job['site_slug']} · {len(ok_rows)} accounts")
             notify.send_document(job["tg_id"], txt)
-            log.info("job=%s report bheja", job_id)
+            log.info("job=%s report bhej diya", job_id)
         else:
             notify.send(job["tg_id"],
                         f"<b>{job['site_slug']}</b>\n0 accounts bane. /logs dekh lo.")
+            log.warning("job=%s zero success", job_id)
 
-        await jobs.update_one({"_id": oid}, {"$set": {"status": "done", "finished_at": now()}})
-        log.info("job=%s DONE ok=%d fail=%d", job_id, len(ok_rows), job["count"] - len(ok_rows))
+        await jobs.update_one({"_id": oid}, {"$set": {
+            "status": "done", "finished_at": now()}})
+        log.info("job=%s DONE ok=%d fail=%d elapsed=%ds",
+                 job_id, len(ok_rows), job["count"] - len(ok_rows),
+                 int(time.time() - started))
+
     except Exception as e:
         log.exception("job=%s crash", job_id)
         await jobs.update_one({"_id": oid}, {"$set": {
