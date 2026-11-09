@@ -76,12 +76,13 @@ async def _one(job_id: str, site: dict, ident: dict, idx: int) -> bool:
     err = "unknown"
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        direct = attempt == MAX_ATTEMPTS
-        if direct:
-            proxy = None
-            log.warning("%s attempt=%d DIRECT fallback", tag, attempt)
-        else:
+        use_proxy = attempt <= settings.proxy_attempts and settings.proxy_mode != "off"
+
+        if use_proxy:
             proxy = _acquire_proxy(tag, attempt)
+        else:
+            proxy = None
+            log.warning("%s attempt=%d DIRECT", tag, attempt)
 
         async with sem:
             try:
@@ -123,8 +124,9 @@ async def run_job(job_id: str) -> None:
         return
 
     started = time.time()
-    log.info("job=%s START site=%s count=%d code=%s proxy_pool=%d",
-             job_id, job["site_slug"], job["count"], job["invite_code"], size())
+    log.info("job=%s START site=%s count=%d code=%s proxy_pool=%d proxy_attempts=%d",
+             job_id, job["site_slug"], job["count"], job["invite_code"],
+             size(), settings.proxy_attempts)
 
     site = await sites.find_one({"slug": job["site_slug"], "enabled": True})
     if not site:
