@@ -5,6 +5,7 @@ from pathlib import Path
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
+import dom
 from captcha import slider, solver_api
 from config import settings
 from identity import fingerprint
@@ -21,7 +22,8 @@ class FamilyAdapter:
         self.doc = doc
         self.sel = doc["selectors"]
         self.pad_right = doc.get("pad_right", 0)
-        self.url = f"{doc['base_url'].rstrip('/')}/#/register"
+        self.base = doc["base_url"].rstrip("/")
+        self.url = f"{self.base}/#/register"
 
     async def validate_invite(self, code: str) -> bool:
         return len(code.strip()) >= 4
@@ -32,33 +34,25 @@ class FamilyAdapter:
         DUMP_DIR.mkdir(parents=True, exist_ok=True)
         stamp = int(time.time())
         try:
-            await page.screenshot(path=str(DUMP_DIR / f"{tag}-{stamp}.png"), full_page=False)
+            await page.screenshot(path=str(DUMP_DIR / f"{tag}-{reason}-{stamp}.png"))
             html = await page.content()
-            (DUMP_DIR / f"{tag}-{stamp}.html").write_text(html, encoding="utf-8")
-            log.info("%s dump likha: %s-%s", tag, reason, stamp)
+            (DUMP_DIR / f"{tag}-{reason}-{stamp}.html").write_text(html, encoding="utf-8")
+            log.info("%s dump: %s-%s", tag, reason, stamp)
         except Exception:
             log.debug("%s dump fail", tag, exc_info=True)
 
-    async def _wait_form(self, page, tag: str) -> str:
-        sels = self.sel.get("form_ready", [])
-        if isinstance(sels, str):
-            sels = [sels]
-        sels = list(sels) + list(self.sel.get("form_ready_alt", []))
-
+    async def _wait_mobile(self, page, tag: str) -> dict:
         deadline = time.monotonic() + settings.form_ms / 1000
         while time.monotonic() < deadline:
-            for s in sels:
-                try:
-                    loc = page.locator(s).first
-                    if await loc.count() and await loc.is_visible():
-                        return s
-                except Exception:
-                    continue
+            r = await dom.find(page, "mobile")
+            if r:
+                return r
             await asyncio.sleep(0.5)
 
-        log.error("%s form selector nahi mila. title=%r url=%s", tag, await page.title(), page.url)
-        await self._dump(page, tag, "form_missing")
-        raise RegisterError("form selector nahi mila")
+        log.error("%s mobile input nahi mila title=%r url=%s",
+                  tag, await page.title(), page.url)
+        await self._dump(page, tag, "no_mobile")
+        raise RegisterError("mobile input nahi mila")
 
     async def _solve(self, page, tag: str) -> bool:
         for n in range(1, 4):
@@ -67,24 +61,20 @@ class FamilyAdapter:
             log.info("%s slide ok=%s distance=%d", tag, res.ok, res.distance)
 
             if res.ok:
-                await page.wait_for_timeout(800)
-                if await page.locator(self.sel["submit"]).first.is_enabled():
+                await page.wait_for_timeout(900)
+                passed = await dom.passed(page)
+                log.info("%s passed=%s", tag, passed)
+                if passed is not False:
                     log.info("%s captcha PASS", tag)
                     return True
-                log.warning("%s captcha reject (button disabled)", tag)
 
             b64 = await slider.screenshot_b64(page, self.sel)
             if b64:
                 await solver_api.solve(b64)
 
-            try:
-                await page.click(self.sel["captcha_refresh"], timeout=3000)
-                log.info("%s captcha refresh", tag)
-                await page.wait_for_timeout(700)
-            except PWTimeout:
-                log.warning("%s refresh nahi mila, reload", tag)
-                await page.reload(wait_until="domcontentloaded")
-                await self._wait_form(page, tag)
+            log.info("%s captcha reload", tag)
+            await page.reload(wait_until="domcontentloaded")
+            await self._wait_mobile(page, tag)
 
         return False
 
@@ -132,39 +122,47 @@ class FamilyAdapter:
                     await self._dump(page, tag, "goto_timeout")
                     raise RegisterError("goto timeout")
 
-                log.info("%s loaded title=%r url=%s", tag, await page.title(), page.url)
+                log.info("%s loaded title=%r", tag, await page.title())
 
-                if "register" not in page.url:
-                    log.warning("%s register route se hat gaya: %s", tag, page.url)
+                mobile_r = await self._wait_mobile(page, tag)
+                log.info("%s mobile input mila", tag)
 
-                ready = await self._wait_form(page, tag)
-                log.info("%s form mila via %r", tag, ready)
+                await dom.fill(page, mobile_r, ident["mobile"])
+                log.info("%s mobile bhara", tag)
 
-                await page.fill(ready, ident["mobile"])
-                await page.fill(self.sel["password"], ident["password"])
-                log.info("%s creds bhare", tag)
+                pw_r = await dom.find(page, "password")
+                if not pw_r:
+                    await self._dump(page, tag, "no_password")
+                    raise RegisterError("password input nahi mila")
+                await dom.fill(page, pw_r, ident["password"])
+                log.info("%s password bhara", tag)
 
-                if ident.get("invite_code"):
-                    try:
-                        await page.fill(self.sel["invite"], ident["invite_code"], timeout=2500)
-                        log.info("%s invite bhara", tag)
-                    except PWTimeout:
-                        log.warning("%s invite field nahi mila", tag)
+                inv_r = await dom.find(page, "invite")
+                if inv_r and ident.get("invite_code"):
+                    await dom.fill(page, inv_r, ident["invite_code"])
+                    log.info("%s invite bhara", tag)
+                elif ident.get("invite_code"):
+                    log.warning("%s invite field nahi mila", tag)
 
                 if not await self._solve(page, tag):
                     await self._dump(page, tag, "captcha_fail")
                     raise RegisterError("captcha unsolved")
 
-                try:
-                    await page.check(self.sel["agree"], timeout=5000)
-                except PWTimeout:
-                    log.warning("%s checkbox nahi mila", tag)
+                cb_r = await dom.find(page, "checkbox")
+                if cb_r:
+                    await dom.click(page, cb_r)
+                    log.info("%s checkbox clicked", tag)
+
+                sub_r = await dom.find(page, "submit")
+                if not sub_r:
+                    await self._dump(page, tag, "no_submit")
+                    raise RegisterError("submit button nahi mila")
 
                 log.info("%s submit click", tag)
-                await page.click(self.sel["submit"])
+                await dom.click(page, sub_r)
+
                 await page.wait_for_function(
-                    "() => !location.hash.includes('register')", timeout=settings.redirect_ms
-                )
+                    "() => !location.hash.includes('register')", timeout=settings.redirect_ms)
                 log.info("%s SUCCESS url=%s", tag, page.url)
 
             except PWTimeout:
