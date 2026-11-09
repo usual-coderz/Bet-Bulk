@@ -7,6 +7,7 @@ import httpx
 
 from config import settings
 from db import proxy_cache
+from httpx_compat import client_kwargs, describe
 
 log = logging.getLogger("proxy")
 
@@ -20,6 +21,7 @@ SOURCES = [
 
 TEST_URL = "https://www.dmplay20.com/"
 DEAD_COOLDOWN = 1800
+UA = "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36"
 
 _pool: list[str] = []
 _dead: dict[str, float] = {}
@@ -43,26 +45,32 @@ async def _fetch(c: httpx.AsyncClient, url: str) -> set[str]:
     try:
         r = await c.get(url, timeout=25)
         if r.status_code != 200:
-            log.warning("source %s -> %d", url[:50], r.status_code)
+            log.warning("source %s -> %d", url[:55], r.status_code)
             return set()
         out = {p for p in (_norm(l) for l in r.text.splitlines()) if p}
-        log.info("source %s -> %d raw", url[:50], len(out))
+        log.info("source %s -> %d raw", url[:55], len(out))
         return out
     except Exception as e:
-        log.warning("source %s fail: %s", url[:50], e)
+        log.warning("source %s fail: %s", url[:55], e)
         return set()
 
 
-async def _check(c: httpx.AsyncClient, proxy: str, sem: asyncio.Semaphore) -> str | None:
+async def _check(proxy: str, sem: asyncio.Semaphore) -> str | None:
     async with sem:
         try:
-            r = await c.get(TEST_URL, proxy=proxy, timeout=12, follow_redirects=True)
-            if r.status_code < 500:
-                return proxy
-            log.debug("Proxy HTTP error %s: %s", proxy, r.status_code)
-        except Exception as e:
-            log.debug("Proxy failed %s: %s: %s", proxy, type(e).__name__, e)
-        return None
+            async with httpx.AsyncClient(
+                **client_kwargs(proxy),
+                timeout=8,
+                follow_redirects=True,
+                headers={"User-Agent": UA},
+            ) as c:
+                r = await c.get(TEST_URL)
+            return proxy if r.status_code < 500 else None
+        except TypeError as e:
+            log.debug("proxy %s type error: %s", proxy, e)
+            return None
+        except Exception:
+            return None
 
 
 async def refresh(force: bool = False) -> int:
@@ -71,23 +79,23 @@ async def refresh(force: bool = False) -> int:
         if not force and _pool and time.time() - _last_refresh < 600:
             return len(_pool)
 
-        log.info("proxy refresh shuru (pool=%d)", len(_pool))
-        async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"},
-                                     follow_redirects=True) as c:
+        log.info("proxy refresh shuru (pool=%d, %s)", len(_pool), describe())
+        async with httpx.AsyncClient(
+            headers={"User-Agent": UA}, follow_redirects=True
+        ) as c:
             raw = set().union(*(await asyncio.gather(*(_fetch(c, u) for u in SOURCES))))
 
         raw -= set(_pool)
         raw = list(raw)[: settings.max_validate]
-        log.info("validate karne ke liye %d candidates", len(raw))
+        log.info("validate candidates: %d", len(raw))
         if not raw:
             _last_refresh = time.time()
             return len(_pool)
 
         sem = asyncio.Semaphore(settings.validate_concurrency)
-        async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as c:
-            results = await asyncio.gather(*(_check(c, p, sem) for p in raw))
-
+        results = await asyncio.gather(*(_check(p, sem) for p in raw))
         good = [p for p in results if p]
+
         log.info("valid proxies: %d / %d", len(good), len(raw))
 
         random.shuffle(good)
@@ -99,7 +107,7 @@ async def refresh(force: bool = False) -> int:
                 await proxy_cache.delete_many({})
                 await proxy_cache.insert_many([{"proxy": p, "at": time.time()} for p in good])
             except Exception:
-                log.warning("proxy cache save fail", exc_info=True)
+                log.warning("cache save fail", exc_info=True)
 
         log.info("pool size ab %d", len(_pool))
         return len(_pool)
@@ -110,12 +118,14 @@ async def load() -> None:
         async for d in proxy_cache.find({}):
             if time.time() - d.get("at", 0) < 3600:
                 _pool.append(d["proxy"])
-        log.info("cache se %d proxy load", len(_pool))
+        log.info("cache se %d load", len(_pool))
     except Exception:
         log.warning("cache load fail", exc_info=True)
 
 
 def pick() -> str | None:
+    if settings.proxy_mode == "off":
+        return None
     t = time.time()
     live = [p for p in _pool if _dead.get(p, 0) < t]
     if not live:
@@ -133,6 +143,9 @@ def size() -> int:
 
 
 async def maintain(stop: asyncio.Event) -> None:
+    if settings.proxy_mode == "off":
+        log.info("proxy_mode=off, fetcher band")
+        return
     await load()
     while not stop.is_set():
         try:
