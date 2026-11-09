@@ -11,16 +11,19 @@ import pdfgen
 from config import settings
 from db import credentials, jobs, sites
 from identity import mobile, password, username
-from proxies import mark_dead, pick, size
+from proxies import mark_dead, mark_ok, pick, size
 from schemas import cred_doc, now
-from sites.base import RegisterError
+from sites.base import CaptchaError, ProxyError, RegisterError
 from sites.registry import build
 
 log = logging.getLogger("runner")
 
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = 3
+CAPTCHA_ALERT_AT = 5
+
 _sem: dict[str, asyncio.Semaphore] = {}
 _heartbeats: dict[str, asyncio.Task] = {}
+_captcha_streak = 0
 
 
 def _text(job: dict, elapsed: int) -> str:
@@ -52,12 +55,23 @@ def _acquire_proxy(tag: str, attempt: int) -> str | None:
     if proxy:
         log.info("%s attempt=%d proxy=%s", tag, attempt, proxy)
         return proxy
-
-    if settings.proxy_mode == "off":
-        log.info("%s attempt=%d DIRECT (mode=off)", tag, attempt)
-    else:
-        log.warning("%s attempt=%d DIRECT (pool khaali size=%d)", tag, attempt, size())
+    log.warning("%s attempt=%d DIRECT (pool khaali size=%d)", tag, attempt, size())
     return None
+
+
+def _note_captcha(slug: str, ok: bool) -> None:
+    global _captcha_streak
+    if ok:
+        _captcha_streak = 0
+        return
+    _captcha_streak += 1
+    if _captcha_streak == CAPTCHA_ALERT_AT:
+        log.error("captcha streak %d — adapter check karo", _captcha_streak)
+        notify.alert_admins(
+            f"<b>{slug}</b>: {_captcha_streak} consecutive captcha fails. "
+            f"/dumps dekho.")
+    if _captcha_streak > CAPTCHA_ALERT_AT and _captcha_streak % 10 == 0:
+        notify.alert_admins(f"<b>{slug}</b>: captcha streak {_captcha_streak}")
 
 
 def _new_idents(job: dict, count: int) -> list[dict]:
@@ -76,31 +90,48 @@ async def _one(job_id: str, site: dict, ident: dict, idx: int) -> bool:
     err = "unknown"
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        use_proxy = attempt <= settings.proxy_attempts and settings.proxy_mode != "off"
-
-        if use_proxy:
+        proxy = None
+        if settings.proxy_mode != "off" and attempt <= settings.proxy_attempts:
             proxy = _acquire_proxy(tag, attempt)
         else:
-            proxy = None
             log.warning("%s attempt=%d DIRECT", tag, attempt)
 
         async with sem:
             try:
                 await adapter.register(ident, proxy)
                 log.info("%s SUCCESS", tag)
+                if proxy:
+                    mark_ok(proxy)
+                _note_captcha(site["slug"], True)
                 await credentials.insert_one(cred_doc(
                     job_id, site["slug"], ident["username"],
                     crypto.enc(ident["password"]), ident["mobile"]))
                 return True
+
+            except ProxyError as e:
+                err = str(e)
+                log.warning("%s proxy fail: %s", tag, err)
+                if proxy:
+                    mark_dead(proxy)
+
+            except CaptchaError as e:
+                err = str(e)
+                log.warning("%s captcha fail: %s", tag, err)
+                if proxy:
+                    mark_ok(proxy)
+                _note_captcha(site["slug"], False)
+
             except RegisterError as e:
                 err = str(e)
                 log.warning("%s fail: %s", tag, err)
+                if proxy:
+                    mark_ok(proxy)
+
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
                 log.warning("%s error: %s", tag, err)
-            finally:
                 if proxy:
-                    mark_dead(proxy)
+                    mark_ok(proxy)
 
         await asyncio.sleep(2 + attempt * 3)
 
