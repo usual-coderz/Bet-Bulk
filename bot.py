@@ -1,30 +1,60 @@
 import asyncio
+import importlib
 import logging
 import signal
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart, StateFilter
-from aiogram.filters.callback_data import CallbackData
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-import jobqueue
-import logging_conf
-import runner
-import selftest
-from config import settings
-from db import DuplicateKeyError, close, init_indexes, invite_codes, jobs, ping, sites
-from httpx_compat import describe as httpx_describe
-from proxies import maintain, refresh, size
-from schemas import job_doc
-from sites.registry import build
-
 log = logging.getLogger("bot")
+
+_UNSHADOWED: str | None = None
+
+
+def _unshadow_queue() -> str | None:
+    """queue.py naam stdlib ko shadow karta hai. Import se pehle hatao."""
+    stray = Path(__file__).resolve().parent / "queue.py"
+    if not stray.exists():
+        return None
+
+    target = stray.with_name("queue_shadowed.py")
+    n = 1
+    while target.exists():
+        target = stray.with_name(f"queue_shadowed_{n}.py")
+        n += 1
+
+    try:
+        stray.rename(target)
+    except OSError as e:
+        return f"rename fail ({e}) — queue.py abhi bhi stdlib shadow kar raha hai"
+    importlib.invalidate_caches()
+    return target.name
+
+
+_UNSHADOWED = _unshadow_queue()
+
+# ---- project imports: sirf unshadow ke baad ----
+from aiogram import Bot, Dispatcher, Router  # noqa: E402
+from aiogram.client.default import DefaultBotProperties  # noqa: E402
+from aiogram.enums import ParseMode  # noqa: E402
+from aiogram.filters import Command, CommandStart, StateFilter  # noqa: E402
+from aiogram.filters.callback_data import CallbackData  # noqa: E402
+from aiogram.fsm.context import FSMContext  # noqa: E402
+from aiogram.fsm.state import State, StatesGroup  # noqa: E402
+from aiogram.types import CallbackQuery, Message  # noqa: E402
+from aiogram.utils.keyboard import InlineKeyboardBuilder  # noqa: E402
+
+import jobqueue  # noqa: E402
+import logging_conf  # noqa: E402
+import runner  # noqa: E402
+import selftest  # noqa: E402
+from config import settings  # noqa: E402
+from db import (  # noqa: E402
+    DuplicateKeyError, close, init_indexes, invite_codes, jobs, ping, sites,
+)
+from httpx_compat import describe as httpx_describe  # noqa: E402
+from proxies import maintain, refresh, size  # noqa: E402
+from schemas import job_doc  # noqa: E402
+from sites.registry import build  # noqa: E402
+
 router = Router()
 
 
@@ -75,6 +105,14 @@ def sched_kb():
     return kb.as_markup()
 
 
+async def _safe_edit(cb: CallbackQuery, text: str, kb=None) -> None:
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        log.debug("edit_text fail, naya message", exc_info=True)
+        await cb.message.answer(text, reply_markup=kb)
+
+
 # ---------- user flow ----------
 
 @router.message(CommandStart())
@@ -99,7 +137,7 @@ async def choose_site(cb: CallbackQuery, callback_data: SiteCB, state: FSMContex
 
     await state.update_data(site_slug=site["slug"], site_name=site["name"])
     await state.set_state(Form.invite)
-    await cb.message.edit_text(f"<b>{site['name']}</b>\nInvitation code bhejo:")
+    await _safe_edit(cb, f"<b>{site['name']}</b>\nInvitation code bhejo:")
     await cb.answer()
 
 
@@ -130,13 +168,20 @@ async def take_count(cb: CallbackQuery, callback_data: CountCB, state: FSMContex
     log.info("count user=%d n=%d", cb.from_user.id, callback_data.n)
     await state.update_data(count=callback_data.n)
     await state.set_state(Form.schedule)
-    await cb.message.edit_text("Gap chuno:", reply_markup=sched_kb())
+    await _safe_edit(cb, "Gap chuno:", sched_kb())
     await cb.answer()
 
 
 @router.callback_query(SchedCB.filter(), StateFilter(Form.schedule))
 async def confirm(cb: CallbackQuery, callback_data: SchedCB, state: FSMContext):
     d = await state.get_data()
+
+    if not d.get("site_slug") or not d.get("invite_code") or not d.get("count"):
+        log.warning("confirm step me state adhura user=%d data=%s",
+                    cb.from_user.id, sorted(d))
+        await state.clear()
+        await cb.answer("State gayab, /start se dobara", show_alert=True)
+        return
 
     try:
         await invite_codes.update_one(
@@ -151,12 +196,13 @@ async def confirm(cb: CallbackQuery, callback_data: SchedCB, state: FSMContext):
         cb.from_user.id, d["site_slug"], d["invite_code"],
         d["count"], callback_data.minutes * 60))
 
-    msg = await cb.message.edit_text(
+    await _safe_edit(
+        cb,
         f"<b>{d['site_name']}</b>\nqueued {d['count']} · gap {callback_data.minutes} min\n"
         f"<code>{res.inserted_id}</code>")
 
     await jobs.update_one({"_id": res.inserted_id},
-                          {"$set": {"progress_msg_id": msg.message_id}})
+                          {"$set": {"progress_msg_id": cb.message.message_id}})
 
     await jobqueue.q.put(str(res.inserted_id))
 
@@ -209,6 +255,8 @@ async def diag(m: Message):
         f"proxy_mode: {settings.proxy_mode}",
         f"proxy pool: {size()}",
         f"queue: {jobqueue.q.qsize()}",
+        f"inflight: {len(jobqueue._inflight)}",
+        f"unshadowed: {_UNSHADOWED or '-'}",
     ]
 
     try:
@@ -223,7 +271,7 @@ async def diag(m: Message):
         await ping()
         lines.append("mongo: OK")
     except Exception as e:
-        lines.append(f"mongo: FAIL {e}")
+        lines.append(f"mongo: FAIL {type(e).__name__}")
 
     lines.append(f"running: {await jobs.count_documents({'status': 'running'})}")
     lines.append(f"queued: {await jobs.count_documents({'status': 'queued'})}")
@@ -241,7 +289,7 @@ async def refresh_proxy(m: Message):
         await m.answer(f"pool ab: {n}")
     except Exception as e:
         log.exception("manual refresh fail")
-        await m.answer(f"fail: {e}")
+        await m.answer(f"fail: {type(e).__name__}")
 
 
 @router.message(Command("sites"))
@@ -255,13 +303,20 @@ async def list_sites(m: Message):
 
 # ---------- boot ----------
 
+async def _watch_stop(dp: Dispatcher, stop: asyncio.Event, bot: Bot) -> None:
+    await stop.wait()
+    log.info("stop signal mila, polling band")
+    await dp.stop_polling()
+
+
 async def main() -> None:
     logging_conf.setup()
     log.info("=== BOOT ===")
 
-    if Path("queue.py").exists():
-        log.warning("queue.py mila — rename karo warna stdlib queue shadow hoga")
-        raise SystemExit("mv queue.py jobqueue.py")
+    if _UNSHADOWED:
+        log.warning("queue.py shadow tha — %s pe rename kiya", _UNSHADOWED)
+        if "fail" in _UNSHADOWED:
+            log.error("rename fail — stdlib queue phir bhi shadow ho sakta hai")
 
     log.info("db=%s workers=%d batch=%d per_site=%d headless=%s",
              settings.mongo_db, settings.job_workers, settings.batch,
@@ -294,11 +349,14 @@ async def main() -> None:
         except NotImplementedError:
             pass
 
+    watcher = asyncio.create_task(_watch_stop(dp, stop, bot))
+
     try:
         await dp.start_polling(bot)
     finally:
         log.info("shutdown shuru")
         stop.set()
+        watcher.cancel()
         await jobqueue.stop()
         await close()
         await bot.session.close()
