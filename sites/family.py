@@ -1,4 +1,7 @@
+import asyncio
 import logging
+import time
+from pathlib import Path
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
@@ -8,6 +11,7 @@ from identity import fingerprint
 from sites.base import RegisterError
 
 log = logging.getLogger("site")
+DUMP_DIR = Path("logs/dumps")
 
 
 class FamilyAdapter:
@@ -21,6 +25,40 @@ class FamilyAdapter:
 
     async def validate_invite(self, code: str) -> bool:
         return len(code.strip()) >= 4
+
+    async def _dump(self, page, tag: str, reason: str) -> None:
+        if not settings.debug_dump:
+            return
+        DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = int(time.time())
+        try:
+            await page.screenshot(path=str(DUMP_DIR / f"{tag}-{stamp}.png"), full_page=False)
+            html = await page.content()
+            (DUMP_DIR / f"{tag}-{stamp}.html").write_text(html, encoding="utf-8")
+            log.info("%s dump likha: %s-%s", tag, reason, stamp)
+        except Exception:
+            log.debug("%s dump fail", tag, exc_info=True)
+
+    async def _wait_form(self, page, tag: str) -> str:
+        sels = self.sel.get("form_ready", [])
+        if isinstance(sels, str):
+            sels = [sels]
+        sels = list(sels) + list(self.sel.get("form_ready_alt", []))
+
+        deadline = time.monotonic() + settings.form_ms / 1000
+        while time.monotonic() < deadline:
+            for s in sels:
+                try:
+                    loc = page.locator(s).first
+                    if await loc.count() and await loc.is_visible():
+                        return s
+                except Exception:
+                    continue
+            await asyncio.sleep(0.5)
+
+        log.error("%s form selector nahi mila. title=%r url=%s", tag, await page.title(), page.url)
+        await self._dump(page, tag, "form_missing")
+        raise RegisterError("form selector nahi mila")
 
     async def _solve(self, page, tag: str) -> bool:
         for n in range(1, 4):
@@ -37,24 +75,25 @@ class FamilyAdapter:
 
             b64 = await slider.screenshot_b64(page, self.sel)
             if b64:
-                log.info("%s api fallback", tag)
                 await solver_api.solve(b64)
 
             try:
                 await page.click(self.sel["captcha_refresh"], timeout=3000)
-                log.info("%s captcha refresh click", tag)
+                log.info("%s captcha refresh", tag)
                 await page.wait_for_timeout(700)
             except PWTimeout:
-                log.warning("%s refresh button nahi mila, reload", tag)
+                log.warning("%s refresh nahi mila, reload", tag)
                 await page.reload(wait_until="domcontentloaded")
-                await page.wait_for_selector(self.sel["form_ready"], timeout=settings.form_ms)
+                await self._wait_form(page, tag)
 
         return False
 
     async def register(self, ident: dict, proxy: str | None) -> dict:
         fp = fingerprint()
         tag = ident["username"]
-        log.info("%s launch proxy=%s", tag, proxy or "DIRECT")
+        goto_ms = settings.goto_ms if not proxy else settings.goto_ms_proxy
+
+        log.info("%s launch proxy=%s goto_ms=%d", tag, proxy or "DIRECT", goto_ms)
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -82,14 +121,26 @@ class FamilyAdapter:
                 "window.chrome={runtime:{}};"
             )
             page = await ctx.new_page()
+            page.set_default_timeout(10000)
+
             try:
                 log.info("%s goto", tag)
-                await page.goto(self.url, wait_until="domcontentloaded", timeout=settings.goto_ms)
-                log.info("%s form wait", tag)
-                await page.wait_for_selector(self.sel["form_ready"], timeout=settings.form_ms)
-                log.info("%s form mila url=%s", tag, page.url)
+                try:
+                    await page.goto(self.url, wait_until="domcontentloaded", timeout=goto_ms)
+                except PWTimeout:
+                    log.error("%s goto timeout", tag)
+                    await self._dump(page, tag, "goto_timeout")
+                    raise RegisterError("goto timeout")
 
-                await page.fill(self.sel["mobile"], ident["mobile"])
+                log.info("%s loaded title=%r url=%s", tag, await page.title(), page.url)
+
+                if "register" not in page.url:
+                    log.warning("%s register route se hat gaya: %s", tag, page.url)
+
+                ready = await self._wait_form(page, tag)
+                log.info("%s form mila via %r", tag, ready)
+
+                await page.fill(ready, ident["mobile"])
                 await page.fill(self.sel["password"], ident["password"])
                 log.info("%s creds bhare", tag)
 
@@ -101,6 +152,7 @@ class FamilyAdapter:
                         log.warning("%s invite field nahi mila", tag)
 
                 if not await self._solve(page, tag):
+                    await self._dump(page, tag, "captcha_fail")
                     raise RegisterError("captcha unsolved")
 
                 try:
@@ -114,8 +166,10 @@ class FamilyAdapter:
                     "() => !location.hash.includes('register')", timeout=settings.redirect_ms
                 )
                 log.info("%s SUCCESS url=%s", tag, page.url)
-            except PWTimeout as e:
-                log.error("%s timeout: %s", tag, str(e)[:160])
+
+            except PWTimeout:
+                log.error("%s timeout url=%s", tag, page.url)
+                await self._dump(page, tag, "timeout")
                 raise RegisterError("timeout / no redirect")
             finally:
                 try:
