@@ -20,11 +20,12 @@ SOURCES = [
 ]
 
 TEST_URL = "https://www.dmplay20.com/"
-DEAD_COOLDOWN = 1800
-UA = "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36"
+UA = ("Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
 
 _pool: list[str] = []
 _dead: dict[str, float] = {}
+_fails: dict[str, int] = {}
 _lock = asyncio.Lock()
 _last_refresh = 0.0
 
@@ -60,17 +61,27 @@ async def _check(proxy: str, sem: asyncio.Semaphore) -> str | None:
         try:
             async with httpx.AsyncClient(
                 **client_kwargs(proxy),
-                timeout=8,
+                timeout=settings.proxy_preflight_ms / 1000,
                 follow_redirects=True,
                 headers={"User-Agent": UA},
             ) as c:
                 r = await c.get(TEST_URL)
-            return proxy if r.status_code < 500 else None
+            # 200 hi healthy hai — 403/404 proxy ka kaam nahi karta
+            return proxy if r.status_code == 200 else None
         except TypeError as e:
             log.debug("proxy %s type error: %s", proxy, e)
             return None
         except Exception:
             return None
+
+
+async def _drop(proxy: str) -> None:
+    global _pool
+    async with _lock:
+        if proxy in _pool:
+            _pool.remove(proxy)
+        _fails.pop(proxy, None)
+        _dead.pop(proxy, None)
 
 
 async def refresh(force: bool = False) -> int:
@@ -88,8 +99,8 @@ async def refresh(force: bool = False) -> int:
         raw -= set(_pool)
         raw = list(raw)[: settings.max_validate]
         log.info("validate candidates: %d", len(raw))
+        _last_refresh = time.time()
         if not raw:
-            _last_refresh = time.time()
             return len(_pool)
 
         sem = asyncio.Semaphore(settings.validate_concurrency)
@@ -97,10 +108,8 @@ async def refresh(force: bool = False) -> int:
         good = [p for p in results if p]
 
         log.info("valid proxies: %d / %d", len(good), len(raw))
-
         random.shuffle(good)
         _pool[:] = list(dict.fromkeys(good + _pool))[:100]
-        _last_refresh = time.time()
 
         if good:
             try:
@@ -135,7 +144,17 @@ def pick() -> str | None:
 
 
 def mark_dead(proxy: str) -> None:
-    _dead[proxy] = time.time() + DEAD_COOLDOWN
+    """Ek fail — bench. Fail limit cross hui to pool se nikaal do."""
+    n = _fails.get(proxy, 0) + 1
+    _fails[proxy] = n
+    _dead[proxy] = time.time() + settings.proxy_cooldown_sec
+    if n >= settings.proxy_fail_limit:
+        log.info("proxy evict %s (%d fails)", proxy, n)
+        asyncio.create_task(_drop(proxy))
+
+
+def mark_ok(proxy: str) -> None:
+    _fails.pop(proxy, None)
 
 
 def size() -> int:
