@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import signal
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
@@ -12,8 +13,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import jobqueue
 import logging_conf
-import queue
 import runner
 import selftest
 from config import settings
@@ -157,7 +158,7 @@ async def confirm(cb: CallbackQuery, callback_data: SchedCB, state: FSMContext):
     await jobs.update_one({"_id": res.inserted_id},
                           {"$set": {"progress_msg_id": msg.message_id}})
 
-    await queue.q.put(str(res.inserted_id))
+    await jobqueue.q.put(str(res.inserted_id))
 
     log.info("QUEUED job=%s user=%d site=%s n=%d gap=%d pool=%d",
              res.inserted_id, cb.from_user.id, d["site_slug"],
@@ -207,7 +208,7 @@ async def diag(m: Message):
         f"httpx: {httpx_describe()}",
         f"proxy_mode: {settings.proxy_mode}",
         f"proxy pool: {size()}",
-        f"queue: {queue.q.qsize()}",
+        f"queue: {jobqueue.q.qsize()}",
     ]
 
     try:
@@ -257,6 +258,11 @@ async def list_sites(m: Message):
 async def main() -> None:
     logging_conf.setup()
     log.info("=== BOOT ===")
+
+    if Path("queue.py").exists():
+        log.warning("queue.py mila — rename karo warna stdlib queue shadow hoga")
+        raise SystemExit("mv queue.py jobqueue.py")
+
     log.info("db=%s workers=%d batch=%d per_site=%d headless=%s",
              settings.mongo_db, settings.job_workers, settings.batch,
              settings.per_site, settings.headless)
@@ -268,13 +274,13 @@ async def main() -> None:
     requeued = 0
     async for j in jobs.find({"status": {"$in": ["queued", "running"]}}):
         await jobs.update_one({"_id": j["_id"]}, {"$set": {"status": "queued"}})
-        await queue.q.put(str(j["_id"]))
+        await jobqueue.q.put(str(j["_id"]))
         requeued += 1
     log.info("requeued %d stuck jobs", requeued)
 
     stop = asyncio.Event()
     asyncio.create_task(maintain(stop))
-    queue.start(runner.run_job, settings.job_workers)
+    jobqueue.start(runner.run_job, settings.job_workers)
 
     bot = Bot(settings.bot_token,
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -293,7 +299,7 @@ async def main() -> None:
     finally:
         log.info("shutdown shuru")
         stop.set()
-        await queue.stop()
+        await jobqueue.stop()
         await close()
         await bot.session.close()
         log.info("=== BYE ===")
