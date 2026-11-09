@@ -17,8 +17,9 @@ import queue
 import runner
 import selftest
 from config import settings
-from db import DuplicateKeyError, close, db, init_indexes, invite_codes, jobs, ping, sites
-from proxies import maintain, size
+from db import DuplicateKeyError, close, init_indexes, invite_codes, jobs, ping, sites
+from httpx_compat import describe as httpx_describe
+from proxies import maintain, refresh, size
 from schemas import job_doc
 from sites.registry import build
 
@@ -73,13 +74,18 @@ def sched_kb():
     return kb.as_markup()
 
 
+# ---------- user flow ----------
+
 @router.message(CommandStart())
 async def start(m: Message, state: FSMContext):
     await state.clear()
     log.info("/start user=%d", m.from_user.id)
+
     rows = [s async for s in sites.find({"enabled": True})]
     if not rows:
+        log.error("koi enabled site nahi mili")
         return await m.answer("Koi site enabled nahi hai. Pehle seed.py chalao.")
+
     await m.answer("Site chuno:", reply_markup=sites_kb(rows))
 
 
@@ -87,7 +93,9 @@ async def start(m: Message, state: FSMContext):
 async def choose_site(cb: CallbackQuery, callback_data: SiteCB, state: FSMContext):
     site = await sites.find_one({"slug": callback_data.slug, "enabled": True})
     if not site:
+        log.warning("site unavailable slug=%s", callback_data.slug)
         return await cb.answer("Unavailable", show_alert=True)
+
     await state.update_data(site_slug=site["slug"], site_name=site["name"])
     await state.set_state(Form.invite)
     await cb.message.edit_text(f"<b>{site['name']}</b>\nInvitation code bhejo:")
@@ -98,13 +106,17 @@ async def choose_site(cb: CallbackQuery, callback_data: SiteCB, state: FSMContex
 async def take_invite(m: Message, state: FSMContext):
     code = (m.text or "").strip()
     d = await state.get_data()
-    site = await sites.find_one({"slug": d["site_slug"]})
+    site = await sites.find_one({"slug": d.get("site_slug")})
+
     if not site:
+        log.error("invite step me site gayab slug=%s", d.get("site_slug"))
+        await state.clear()
         return await m.answer("Site gayab ho gayi. /start")
 
     log.info("invite user=%d site=%s code=%s", m.from_user.id, site["slug"], code)
+
     if not await build(site).validate_invite(code):
-        log.warning("invite invalid code=%s", code)
+        log.warning("invite invalid site=%s code=%s", site["slug"], code)
         return await m.answer("Code invalid lag raha hai. Dobara bhejo.")
 
     await state.update_data(invite_code=code)
@@ -114,6 +126,7 @@ async def take_invite(m: Message, state: FSMContext):
 
 @router.callback_query(CountCB.filter(), StateFilter(Form.count))
 async def take_count(cb: CallbackQuery, callback_data: CountCB, state: FSMContext):
+    log.info("count user=%d n=%d", cb.from_user.id, callback_data.n)
     await state.update_data(count=callback_data.n)
     await state.set_state(Form.schedule)
     await cb.message.edit_text("Gap chuno:", reply_markup=sched_kb())
@@ -123,6 +136,7 @@ async def take_count(cb: CallbackQuery, callback_data: CountCB, state: FSMContex
 @router.callback_query(SchedCB.filter(), StateFilter(Form.schedule))
 async def confirm(cb: CallbackQuery, callback_data: SchedCB, state: FSMContext):
     d = await state.get_data()
+
     try:
         await invite_codes.update_one(
             {"site_slug": d["site_slug"], "code": d["invite_code"]},
@@ -130,7 +144,7 @@ async def confirm(cb: CallbackQuery, callback_data: SchedCB, state: FSMContext):
             upsert=True,
         )
     except DuplicateKeyError:
-        pass
+        log.debug("invite code already bound code=%s", d["invite_code"])
 
     res = await jobs.insert_one(job_doc(
         cb.from_user.id, d["site_slug"], d["invite_code"],
@@ -139,22 +153,37 @@ async def confirm(cb: CallbackQuery, callback_data: SchedCB, state: FSMContext):
     msg = await cb.message.edit_text(
         f"<b>{d['site_name']}</b>\nqueued {d['count']} · gap {callback_data.minutes} min\n"
         f"<code>{res.inserted_id}</code>")
+
     await jobs.update_one({"_id": res.inserted_id},
                           {"$set": {"progress_msg_id": msg.message_id}})
 
     await queue.q.put(str(res.inserted_id))
-    log.info("QUEUED job=%s user=%d site=%s n=%d gap=%d",
+
+    log.info("QUEUED job=%s user=%d site=%s n=%d gap=%d pool=%d",
              res.inserted_id, cb.from_user.id, d["site_slug"],
-             d["count"], callback_data.minutes)
+             d["count"], callback_data.minutes, size())
+
     await state.clear()
     await cb.answer("Queued")
 
 
 @router.message(Command("cancel"))
 async def cancel(m: Message, state: FSMContext):
+    log.info("cancel user=%d", m.from_user.id)
     await state.clear()
     await m.answer("Cancel.")
 
+
+@router.message(Command("jobs"))
+async def my_jobs(m: Message):
+    rows = []
+    async for j in jobs.find({"tg_id": m.from_user.id}).sort("created_at", -1).limit(5):
+        rows.append(f"<code>{j['_id']}</code> {j['site_slug']} {j['status']} "
+                    f"{j['done']}/{j['count']}")
+    await m.answer("\n".join(rows) or "koi job nahi")
+
+
+# ---------- admin ----------
 
 @router.message(Command("logs"))
 async def logs_cmd(m: Message):
@@ -171,9 +200,15 @@ async def logs_cmd(m: Message):
 async def diag(m: Message):
     if not _admin(m.from_user.id):
         return
+
     from playwright.async_api import async_playwright
 
-    lines = [f"queue: {queue.q.qsize()}", f"proxies: {size()}"]
+    lines = [
+        f"httpx: {httpx_describe()}",
+        f"proxy_mode: {settings.proxy_mode}",
+        f"proxy pool: {size()}",
+        f"queue: {queue.q.qsize()}",
+    ]
 
     try:
         async with async_playwright() as p:
@@ -194,11 +229,30 @@ async def diag(m: Message):
     await m.answer("\n".join(lines))
 
 
+@router.message(Command("refreshproxy"))
+async def refresh_proxy(m: Message):
+    if not _admin(m.from_user.id):
+        return
+    await m.answer("refresh chalu...")
+    try:
+        n = await refresh(force=True)
+        log.info("manual proxy refresh -> %d", n)
+        await m.answer(f"pool ab: {n}")
+    except Exception as e:
+        log.exception("manual refresh fail")
+        await m.answer(f"fail: {e}")
+
+
 @router.message(Command("sites"))
 async def list_sites(m: Message):
-    rows = [f"{s['slug']} enabled={s['enabled']}" async for s in sites.find({})]
+    if not _admin(m.from_user.id):
+        return
+    rows = [f"{s['slug']} enabled={s['enabled']} pad={s.get('pad_right', 0)}"
+            async for s in sites.find({})]
     await m.answer("\n".join(rows) or "khaali")
 
+
+# ---------- boot ----------
 
 async def main() -> None:
     logging_conf.setup()
@@ -206,6 +260,7 @@ async def main() -> None:
     log.info("db=%s workers=%d batch=%d per_site=%d headless=%s",
              settings.mongo_db, settings.job_workers, settings.batch,
              settings.per_site, settings.headless)
+    log.info("httpx=%s proxy_mode=%s", httpx_describe(), settings.proxy_mode)
 
     await selftest.run()
     await init_indexes()
