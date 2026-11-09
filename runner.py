@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import secrets
+import random
 import time
 
 from bson import ObjectId
@@ -18,6 +18,7 @@ from sites.registry import build
 
 log = logging.getLogger("runner")
 
+MAX_ATTEMPTS = 4
 _sem: dict[str, asyncio.Semaphore] = {}
 _heartbeats: dict[str, asyncio.Task] = {}
 
@@ -48,7 +49,6 @@ async def _heartbeat(oid: ObjectId, started: float) -> None:
 
 def _acquire_proxy(tag: str, attempt: int) -> str | None:
     proxy = pick()
-
     if proxy:
         log.info("%s attempt=%d proxy=%s", tag, attempt, proxy)
         return proxy
@@ -56,9 +56,17 @@ def _acquire_proxy(tag: str, attempt: int) -> str | None:
     if settings.proxy_mode == "off":
         log.info("%s attempt=%d DIRECT (mode=off)", tag, attempt)
     else:
-        log.warning("%s attempt=%d DIRECT (pool khaali, size=%d)", tag, attempt, size())
-
+        log.warning("%s attempt=%d DIRECT (pool khaali size=%d)", tag, attempt, size())
     return None
+
+
+def _new_idents(job: dict, count: int) -> list[dict]:
+    return [{
+        "username": username(),
+        "password": password(),
+        "mobile": mobile(),
+        "invite_code": job["invite_code"],
+    } for _ in range(count)]
 
 
 async def _one(job_id: str, site: dict, ident: dict, idx: int) -> bool:
@@ -67,8 +75,13 @@ async def _one(job_id: str, site: dict, ident: dict, idx: int) -> bool:
     tag = f"job={job_id[:8]} #{idx} {ident['username']}"
     err = "unknown"
 
-    for attempt in range(1, 4):
-        proxy = _acquire_proxy(tag, attempt)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        direct = attempt == MAX_ATTEMPTS
+        if direct:
+            proxy = None
+            log.warning("%s attempt=%d DIRECT fallback", tag, attempt)
+        else:
+            proxy = _acquire_proxy(tag, attempt)
 
         async with sem:
             try:
@@ -83,28 +96,19 @@ async def _one(job_id: str, site: dict, ident: dict, idx: int) -> bool:
                 log.warning("%s fail: %s", tag, err)
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
-                log.exception("%s unexpected error", tag)
+                log.warning("%s error: %s", tag, err)
             finally:
                 if proxy:
                     mark_dead(proxy)
 
-        await asyncio.sleep(3 + attempt * 4)
+        await asyncio.sleep(2 + attempt * 3)
 
-    log.error("%s FAILED 3 attempts: %s", tag, err)
+    log.error("%s FAILED %d attempts: %s", tag, MAX_ATTEMPTS, err)
     await credentials.insert_one(cred_doc(
         job_id, site["slug"], ident["username"],
         crypto.enc(ident["password"]), ident["mobile"],
         status="failed", error=err))
     return False
-
-
-def _new_idents(job: dict, count: int) -> list[dict]:
-    return [{
-        "username": username(),
-        "password": password(),
-        "mobile": mobile(),
-        "invite_code": job["invite_code"],
-    } for _ in range(count)]
 
 
 async def run_job(job_id: str) -> None:
@@ -147,7 +151,7 @@ async def run_job(job_id: str) -> None:
 
             for i, ident in enumerate(idents):
                 tasks.append(asyncio.create_task(_one(job_id, site, ident, start + i + 1)))
-                await asyncio.sleep(secrets.randint(5, 10))
+                await asyncio.sleep(random.randint(5, 10))
 
             results = await asyncio.gather(*tasks)
             done, failed = sum(results), len(results) - sum(results)
