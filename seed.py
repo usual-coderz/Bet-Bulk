@@ -14,8 +14,16 @@ SEED = [
 async def main() -> None:
     await init_indexes()
     for s in SEED:
-        await sites.update_one({"slug": s["slug"]}, {"$setOnInsert": s}, upsert=True)
-    print("4 sites seeded")
+        # selectors/name/base_url update, pad_right force reset
+        doc = dict(s)
+        doc.pop("created_at", None)
+        doc["pad_right"] = 0
+        await sites.update_one(
+            {"slug": s["slug"]},
+            {"$set": doc, "$setOnInsert": {"created_at": s["created_at"]}},
+            upsert=True,
+        )
+    print("4 sites seeded, pad_right=0")
 
 
 if __name__ == "__main__":
