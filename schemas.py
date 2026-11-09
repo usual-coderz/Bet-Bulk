@@ -7,6 +7,15 @@ def now() -> datetime:
 
 BASE_SELECTORS = {
     "form_ready": "input[type=tel]",
+    "form_ready_alt": [
+        "input[placeholder*='obile']",
+        "input[placeholder*='hone']",
+        "input[placeholder*='umber']",
+        "input[inputmode='numeric']",
+        "input[type=number]",
+        "input[name*=mobile]",
+        "input[name*=phone]",
+    ],
     "mobile": "input[type=tel]",
     "password": "input[type=password]",
     "invite": "input[name*=invite]",
@@ -20,13 +29,16 @@ BASE_SELECTORS = {
 
 def site_doc(slug: str, name: str, base_url: str,
              selectors: dict | None = None, pad_right: int = 0) -> dict:
+    merged = dict(BASE_SELECTORS)
+    if selectors:
+        merged.update(selectors)
     return {
         "slug": slug,
         "name": name,
         "enabled": True,
         "base_url": base_url,
         "pad_right": pad_right,
-        "selectors": {**BASE_SELECTORS, **(selectors or {})},
+        "selectors": merged,
         "created_at": now(),
     }
 
@@ -45,6 +57,7 @@ def job_doc(tg_id: int, site_slug: str, invite_code: str, count: int, gap_sec: i
         "error": None,
         "created_at": now(),
         "claimed_at": None,
+        "finished_at": None,
     }
 
 
