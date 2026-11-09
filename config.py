@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     captcha_key: str = ""
     log_level: str = "INFO"
 
+    proxy_mode: str = "auto"      # auto | off
     job_workers: int = 1
     batch: int = 4
     per_site: int = 2
