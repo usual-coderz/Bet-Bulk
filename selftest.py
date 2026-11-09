@@ -2,19 +2,23 @@ import logging
 
 from config import settings
 from db import ping
-from proxies import size, refresh
+from httpx_compat import describe
+from proxies import refresh, size
 
 log = logging.getLogger("selftest")
 
 
 async def run() -> None:
-    problems = []
+    fatal: list[str] = []
+    warn: list[str] = []
+
+    log.info("httpx: %s", describe())
 
     try:
         await ping()
         log.info("mongo OK")
     except Exception as e:
-        problems.append(f"mongo: {e}")
+        fatal.append(f"mongo: {e}")
 
     try:
         from playwright.async_api import async_playwright
@@ -24,22 +28,28 @@ async def run() -> None:
             log.info("chromium OK %s", b.version)
             await b.close()
     except Exception as e:
-        problems.append(
-            f"chromium: {e}\n-> chalao: playwright install --with-deps chromium"
-        )
+        fatal.append(f"chromium: {e}\n-> chalao: playwright install --with-deps chromium")
 
-    try:
-        n = await refresh(force=True)
-        log.info("proxy pool %d", n)
-        if n == 0:
-            problems.append("proxy pool khaali")
-    except Exception as e:
-        problems.append(f"proxy fetch: {e}")
+    if settings.proxy_mode != "off":
+        try:
+            n = await refresh(force=True)
+            log.info("proxy pool %d", n)
+            if n == 0:
+                warn.append("proxy pool 0 — DIRECT mode me chalega, par rate-limit jaldi aayegi")
+            elif n < 10:
+                warn.append(f"proxy pool sirf {n} — kam hai")
+        except Exception as e:
+            warn.append(f"proxy fetch: {e}")
+    else:
+        log.info("proxy_mode=off, skip")
 
     if not settings.admins:
-        problems.append("ADMIN_IDS khaali (diag commands kaam nahi karengi)")
+        warn.append("ADMIN_IDS khaali")
 
-    if problems:
-        raise SystemExit("SELFTEST FAIL:\n- " + "\n- ".join(problems))
+    for w in warn:
+        log.warning("WARN: %s", w)
 
-    log.info("selftest pass")
+    if fatal:
+        raise SystemExit("SELFTEST FAIL:\n- " + "\n- ".join(fatal))
+
+    log.info("selftest pass (warnings=%d)", len(warn))
