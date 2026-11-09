@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import math
 import random
@@ -11,8 +12,8 @@ import dom
 
 log = logging.getLogger("captcha")
 
-MIN_W, MAX_W = 26, 100
-MIN_H, MAX_H = 26, 100
+MIN_W, MAX_W = 22, 110
+MIN_H, MAX_H = 22, 110
 
 
 @dataclass
@@ -35,12 +36,12 @@ def detect_gap(img_bgr: np.ndarray) -> int:
         x, y, cw, ch = cv2.boundingRect(c)
         if not (MIN_W <= cw <= MAX_W and MIN_H <= ch <= MAX_H):
             continue
-        if not (0.55 <= cw / ch <= 1.8):
+        if not (0.5 <= cw / ch <= 2.0):
             continue
         area = cv2.contourArea(c)
-        if area < 650:
+        if area < 400:
             continue
-        if x < w * 0.20:
+        if x < w * 0.10:
             continue
         score = (area / (cw * ch)) * (x / w)
         if score > best_score:
@@ -64,40 +65,47 @@ def _trajectory(distance: int, steps: int = 42):
     return out
 
 
-async def slide(page, sel: dict, pad_right: int = 0) -> SlideResult:
-    widget = await dom.find(page, "captcha")
-    if not widget:
-        log.warning("captcha widget nahi mila (DOM probe)")
-        return SlideResult(False)
-
-    img_r, handle_r = widget["img"], widget["handle"]
-    log.info("widget img=%dx%d handle=%.0f,%.0f",
-             int(img_r["w"]), int(img_r["h"]), handle_r["x"], handle_r["y"])
-
+async def _shot(img_loc) -> np.ndarray | None:
     try:
-        shot = await page.screenshot(clip={
-            "x": img_r["x"], "y": img_r["y"],
-            "width": img_r["w"], "height": img_r["h"],
-        })
+        raw = await img_loc.screenshot(scale="css")   # 1 px == 1 CSS px
+    except TypeError:
+        raw = await img_loc.screenshot()
     except Exception as e:
         log.warning("captcha screenshot fail: %s", e)
-        return SlideResult(False)
+        return None
+    return cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
 
-    img = cv2.imdecode(np.frombuffer(shot, np.uint8), cv2.IMREAD_COLOR)
+
+async def slide(page, sel: dict, pad_right: int = 0,
+                x_hint: int | None = None) -> SlideResult:
+    w = await dom.find_captcha(page)
+    if not w:
+        log.warning("captcha widget nahi mila")
+        return SlideResult(False)
+    img_l, handle_l = w
+
+    img = await _shot(img_l)
     if img is None:
-        log.warning("captcha decode fail")
         return SlideResult(False)
 
     try:
         gap_cx = detect_gap(img)
     except LookupError:
-        log.warning("gap detect nahi hua")
+        if x_hint is None:
+            log.warning("gap detect nahi hua, hint bhi nahi")
+            return SlideResult(False)
+        gap_cx = x_hint
+        log.info("CV fail, solver hint use: %d", gap_cx)
+
+    ib = await img_l.bounding_box()
+    hb = await handle_l.bounding_box()
+    if not ib or not hb:
+        log.warning("bounding box nahi mila")
         return SlideResult(False)
 
-    sx = handle_r["x"] + handle_r["w"] / 2
-    sy = handle_r["y"] + handle_r["h"] / 2
-    distance = int((img_r["x"] + gap_cx) - sx) - pad_right
-
+    sx = hb["x"] + hb["width"] / 2
+    sy = hb["y"] + hb["height"] / 2
+    distance = int((ib["x"] + gap_cx) - sx) - pad_right
     log.info("gap_cx=%d distance=%d pad=%d", gap_cx, distance, pad_right)
 
     if abs(distance) <= 6:
@@ -128,15 +136,13 @@ async def slide(page, sel: dict, pad_right: int = 0) -> SlideResult:
 
 
 async def screenshot_b64(page, sel: dict) -> str | None:
-    import base64
-
-    widget = await dom.find(page, "captcha")
-    if not widget:
+    w = await dom.find_captcha(page)
+    if not w:
         return None
-    r = widget["img"]
     try:
-        shot = await page.screenshot(clip={
-            "x": r["x"], "y": r["y"], "width": r["w"], "height": r["h"]})
-        return base64.b64encode(shot).decode()
+        raw = await w[0].screenshot(scale="css")
+    except TypeError:
+        raw = await w[0].screenshot()
     except Exception:
         return None
+    return base64.b64encode(raw).decode()
