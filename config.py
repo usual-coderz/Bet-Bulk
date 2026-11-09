@@ -20,14 +20,15 @@ class Settings(BaseSettings):
     max_accounts_per_job: int = 25
 
     # proxy
-    proxy_mode: str = "auto"          # auto | off
+    proxy_mode: str = "auto"           # auto | off
+    proxy_attempts: int = 2            # kitne attempt proxy pe, baaki DIRECT
     max_validate: int = 200
     validate_concurrency: int = 40
     proxy_refresh_sec: int = 1200
 
     # browser timeouts
     goto_ms: int = 30000
-    goto_ms_proxy: int = 15000
+    goto_ms_proxy: int = 12000
     form_ms: int = 20000
     redirect_ms: int = 45000
     headless: bool = True
