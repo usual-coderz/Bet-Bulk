@@ -20,16 +20,20 @@ class Settings(BaseSettings):
     max_accounts_per_job: int = 25
 
     # proxy
-    proxy_mode: str = "auto"           # auto | off
-    proxy_attempts: int = 2            # kitne attempt proxy pe, baaki DIRECT
+    proxy_mode: str = "auto"            # auto | off
+    proxy_attempts: int = 1             # kitne attempt proxy pe, baaki DIRECT
     max_validate: int = 200
     validate_concurrency: int = 40
     proxy_refresh_sec: int = 1200
+    proxy_preflight_ms: int = 4000      # pool load pe health probe budget
+    proxy_fail_limit: int = 2           # itni fail ke baad pool se nikaal do
+    proxy_cooldown_sec: int = 1800
 
     # browser timeouts
     goto_ms: int = 30000
-    goto_ms_proxy: int = 12000
+    goto_ms_proxy: int = 20000
     form_ms: int = 20000
+    captcha_ms: int = 12000
     redirect_ms: int = 45000
     headless: bool = True
 
